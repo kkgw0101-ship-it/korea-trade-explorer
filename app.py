@@ -14,11 +14,19 @@ import sample_data
 import theme
 from country_codes import COUNTRY_CODES
 from hs_presets import HS_PRESETS
+from market_data import (
+    MARKET_SERIES,
+    MarketDataError,
+    fetch_fred_bundle,
+    indexed_series,
+    series_snapshot,
+)
 from trade_data import (
     TradeDataError,
     analysis_summary,
     fetch_trade,
     normalize_key,
+    percent_change,
     prepare_periods,
 )
 
@@ -65,6 +73,49 @@ def format_rate(value: float | None, *, prefix: str = "") -> tuple[str, str]:
     return f"{prefix}{sign}{value:,.1f}%", tone
 
 
+def format_quote_change(value: float | None) -> tuple[str, str]:
+    if value is None or pd.isna(value):
+        return "• N/A", "neutral"
+    if abs(value) < 0.05:
+        return "• 0.0%", "neutral"
+    arrow = "▲" if value > 0 else "▼"
+    tone = "up" if value > 0 else "down"
+    return f"{arrow} {abs(value):,.1f}%", tone
+
+
+def format_market_value(series_id: str, value: float) -> str:
+    metadata = MARKET_SERIES[series_id]
+    return f"{value:{metadata['format']}}"
+
+
+def filter_window(frame: pd.DataFrame, window: str, date_col: str) -> pd.DataFrame:
+    if frame.empty or window == "ALL":
+        return frame.copy()
+    offsets = {"6M": pd.DateOffset(months=6), "1Y": pd.DateOffset(years=1), "3Y": pd.DateOffset(years=3)}
+    latest = pd.Timestamp(frame[date_col].max())
+    return frame.loc[frame[date_col] >= latest - offsets[window]].copy()
+
+
+def trade_index_frame(periods: pd.DataFrame, window: str) -> pd.DataFrame:
+    """금액·중량·단가를 첫 관측월=100으로 맞춘 비교 시계열."""
+    selected = filter_window(periods, window, "period_date")
+    definitions = {
+        "수출금액": "export_usd",
+        "수출중량": "export_wgt",
+        "수출단가": "export_unit_usd",
+    }
+    pieces: list[pd.DataFrame] = []
+    for label, column in definitions.items():
+        part = selected[["period_date", "label", column]].dropna().copy()
+        nonzero = part.loc[part[column] != 0, column]
+        if part.empty or nonzero.empty:
+            continue
+        part["index"] = part[column] / float(nonzero.iloc[0]) * 100
+        part["지표"] = label
+        pieces.append(part.rename(columns={column: "actual"}))
+    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+
+
 def get_deployed_key() -> str:
     try:
         return str(st.secrets.get("DATA_GO_KR_SERVICE_KEY", "")).strip()
@@ -102,6 +153,12 @@ def cached_trade(
     end_ym: str,
 ) -> pd.DataFrame:
     return fetch_trade(service_key, hs_code, country_code, start_ym, end_ym)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_market_indicators() -> dict[str, pd.DataFrame]:
+    """FRED 외부 시장지표를 6시간 동안 캐시한다."""
+    return fetch_fred_bundle()
 
 
 def load_sample(start_ym: str, end_ym: str, hs_code: str, country: str) -> pd.DataFrame:
@@ -316,11 +373,82 @@ if periods.empty:
     st.stop()
 
 summary = analysis_summary(periods)
+latest_row = periods.iloc[-1]
+prior_row = periods.iloc[-2] if len(periods) >= 2 else None
+latest_unit_value = latest_row["export_unit_usd"]
+unit_mom = (
+    percent_change(float(latest_unit_value), float(prior_row["export_unit_usd"]))
+    if prior_row is not None
+    and pd.notna(latest_unit_value)
+    and pd.notna(prior_row["export_unit_usd"])
+    else None
+)
+
+market_error: str | None = None
+try:
+    market_frames = cached_market_indicators()
+except MarketDataError as exc:
+    market_frames = {}
+    market_error = str(exc)
+market_snapshots = {
+    series_id: series_snapshot(frame) for series_id, frame in market_frames.items()
+}
+
 query_title = f"HS {meta['hs']} · {meta['label']}"
 theme.section_title(
     query_title,
     f"상대국 {meta['country']} · {summary['months']}개월 관측 · 최신 관측월 {summary['latest_period']}",
 )
+
+value_change, value_tone = format_quote_change(summary["export_mom"])
+weight_change, weight_tone = format_quote_change(summary["export_wgt_mom"])
+unit_change, unit_tone = format_quote_change(unit_mom)
+latest_balance = float(latest_row["balance_usd"])
+ticker_items = [
+    {
+        "label": "수출 신고금액",
+        "status": "MONTHLY CLOSE",
+        "value": format_money(summary["latest_export"]),
+        "change": value_change,
+        "tone": value_tone,
+    },
+    {
+        "label": "수출 중량",
+        "status": "MONTHLY CLOSE",
+        "value": format_weight(summary["latest_export_wgt"]),
+        "change": weight_change,
+        "tone": weight_tone,
+    },
+    {
+        "label": "수출 신고단가",
+        "status": "MONTHLY CLOSE",
+        "value": f"${latest_unit_value:,.2f}/kg" if pd.notna(latest_unit_value) else "N/A",
+        "change": unit_change,
+        "tone": unit_tone,
+    },
+    {
+        "label": "월 무역수지",
+        "status": "MONTHLY CLOSE",
+        "value": format_money(latest_balance),
+        "change": "흑자" if latest_balance >= 0 else "적자",
+        "tone": "up" if latest_balance >= 0 else "down",
+    },
+]
+for series_id, snapshot in market_snapshots.items():
+    if not snapshot:
+        continue
+    quote_change, quote_tone = format_quote_change(snapshot.get("change_pct"))
+    metadata = MARKET_SERIES[series_id]
+    ticker_items.append(
+        {
+            "label": metadata["name"],
+            "status": metadata["frequency"],
+            "value": format_market_value(series_id, float(snapshot["latest_value"])),
+            "change": quote_change,
+            "tone": quote_tone,
+        }
+    )
+theme.market_tape(ticker_items)
 
 growth_note, growth_tone = format_rate(summary["recent_12_growth"], prefix="직전 12개월 대비 ")
 mom_note, mom_tone = format_rate(summary["export_mom"], prefix="전월 대비 ")
@@ -343,9 +471,258 @@ with kpi_cols[3]:
     theme.kpi_card("04", f"최근 월 수출금액 · {summary['latest_period']}", format_money(summary["latest_export"]), mom_note, mom_tone)
 
 st.write("")
-amount_tab, weight_tab, balance_tab, data_tab, method_tab = st.tabs(
-    ["금액 분석", "중량 분석", "수지 · 단가", "데이터", "해석 기준"]
+market_tab, amount_tab, weight_tab, balance_tab, data_tab, method_tab = st.tabs(
+    ["Market Pulse", "금액 분석", "중량 분석", "수지 · 단가", "데이터", "해석 기준"]
 )
+
+with market_tab:
+    observation_dates = [
+        str(snapshot.get("latest_date"))
+        for snapshot in market_snapshots.values()
+        if snapshot and snapshot.get("latest_date")
+    ]
+    market_freshness = max(observation_dates) if observation_dates else "연결 대기"
+    connection_copy = (
+        f"EXTERNAL MARKET LATEST OBSERVATION · {market_freshness} · FRED 6H CACHE"
+        if market_frames
+        else "EXTERNAL MARKET DATA · TEMPORARILY UNAVAILABLE · TRADE DATA ACTIVE"
+    )
+    st.markdown(
+        "<div class='market-status-row'>"
+        f"<div class='market-status-left'><span class='market-live-dot{' offline' if not market_frames else ''}'></span>"
+        f"<span>{'MARKET MONITOR ACTIVE' if market_frames else 'MARKET MONITOR DEGRADED'}</span></div>"
+        f"<span>{theme.esc(connection_copy)}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    terminal_col, signal_col = st.columns([2.2, 1], gap="large")
+    with terminal_col:
+        st.markdown("<div class='chart-heading'>수출 모멘텀 비교지수</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='chart-subtitle'>선택 구간의 첫 관측월=100 · 금액·중량·단가의 상대 흐름 비교</div>",
+            unsafe_allow_html=True,
+        )
+        terminal_window = st.radio(
+            "수출 모멘텀 조회 구간",
+            ["6M", "1Y", "3Y", "ALL"],
+            index=1,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="trade_terminal_window",
+        )
+        trade_index = trade_index_frame(periods, terminal_window)
+        if trade_index.empty or trade_index["period_date"].nunique() < 2:
+            st.info("선택 구간에 비교 가능한 관측값이 부족합니다.")
+        else:
+            terminal_nearest = alt.selection_point(
+                nearest=True,
+                on="pointerover",
+                fields=["period_date"],
+                empty=False,
+                clear="pointerout",
+            )
+            terminal_colors = alt.Scale(
+                domain=["수출금액", "수출중량", "수출단가"],
+                range=[theme.EXPORT, theme.IMPORT, theme.BRAND_RED],
+            )
+            terminal_base = alt.Chart(trade_index).encode(
+                x=alt.X(
+                    "period_date:T",
+                    title=None,
+                    axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=8),
+                )
+            )
+            terminal_lines = terminal_base.mark_line(strokeWidth=2.4).encode(
+                y=alt.Y("index:Q", title="비교지수 (시작=100)", scale=alt.Scale(zero=False)),
+                color=alt.Color("지표:N", scale=terminal_colors, legend=alt.Legend(title=None, orient="top")),
+                tooltip=[
+                    alt.Tooltip("label:N", title="기간"),
+                    alt.Tooltip("지표:N"),
+                    alt.Tooltip("index:Q", title="비교지수", format=",.1f"),
+                    alt.Tooltip("actual:Q", title="원값", format=",.2f"),
+                ],
+            )
+            terminal_selectors = terminal_base.mark_point(opacity=0).add_params(terminal_nearest)
+            terminal_points = terminal_lines.mark_point(size=65, filled=True).encode(
+                opacity=alt.condition(terminal_nearest, alt.value(1), alt.value(0))
+            )
+            terminal_rule = terminal_base.mark_rule(color=theme.INK, opacity=.24).encode(
+                opacity=alt.condition(terminal_nearest, alt.value(.45), alt.value(0))
+            ).transform_filter(terminal_nearest)
+            terminal_latest = (
+                trade_index.sort_values("period_date").groupby("지표", as_index=False).tail(1)
+            )
+            terminal_end_points = alt.Chart(terminal_latest).mark_point(size=54, filled=True).encode(
+                x="period_date:T",
+                y="index:Q",
+                color=alt.Color("지표:N", scale=terminal_colors, legend=None),
+            )
+            terminal_end_labels = alt.Chart(terminal_latest).mark_text(
+                align="left", dx=7, font="IBM Plex Mono", fontSize=10
+            ).encode(
+                x="period_date:T",
+                y="index:Q",
+                text=alt.Text("index:Q", format=",.1f"),
+                color=alt.Color("지표:N", scale=terminal_colors, legend=None),
+            )
+            terminal_chart = (
+                terminal_lines
+                + terminal_selectors
+                + terminal_points
+                + terminal_rule
+                + terminal_end_points
+                + terminal_end_labels
+            ).properties(height=350, padding={"right": 44})
+            st.altair_chart(chart_style(terminal_chart), width="stretch")
+
+    with signal_col:
+        st.markdown("<div class='chart-heading'>LVT Market Signals</div>", unsafe_allow_html=True)
+        st.markdown("<div class='chart-subtitle'>규칙 기반 모멘텀 스캔 · 투자 신호 아님</div>", unsafe_allow_html=True)
+        volume_signal = summary.get("export_wgt_yoy")
+        if volume_signal is None:
+            theme.signal_card("VOLUME NEUTRAL", "물량 비교기간 부족", "전년 동월 관측값이 확보되면 물량 모멘텀을 표시합니다.", "neutral")
+        else:
+            theme.signal_card(
+                "VOLUME UP" if volume_signal >= 0 else "VOLUME WATCH",
+                f"수출중량 전년동월 대비 {volume_signal:+.1f}%",
+                "신고금액과 분리해 실물 물동량의 방향을 보여줍니다.",
+                "positive" if volume_signal >= 0 else "negative",
+            )
+        if unit_mom is None:
+            theme.signal_card("PRICE NEUTRAL", "단가 비교기간 부족", "신고중량이 확보되면 kg당 단가 변화를 표시합니다.", "neutral")
+        else:
+            theme.signal_card(
+                "PRICE UP" if unit_mom >= 0 else "PRICE WATCH",
+                f"수출 신고단가 전월 대비 {unit_mom:+.1f}%",
+                "금액 변화가 가격·품목 구성 측에서 발생했는지 확인하는 보조 신호입니다.",
+                "positive" if unit_mom >= 0 else "negative",
+            )
+        housing = market_snapshots.get("HOUST", {})
+        housing_change = housing.get("change_pct") if housing else None
+        if housing_change is None:
+            theme.signal_card("DEMAND OFFLINE", "미국 수요지표 연결 대기", "외부 연결 실패와 무관하게 무역 분석은 계속 사용할 수 있습니다.", "neutral")
+        else:
+            theme.signal_card(
+                "DEMAND UP" if housing_change >= 0 else "DEMAND WATCH",
+                f"미국 주택착공 전월 대비 {float(housing_change):+.1f}%",
+                "LVT 최종 수요 환경을 읽기 위한 거시 보조지표이며 직접 매출 지표는 아닙니다.",
+                "positive" if housing_change >= 0 else "negative",
+            )
+
+    st.write("")
+    theme.section_title(
+        "External Market Monitor",
+        "환율·에너지·미국 주택시장의 최신 공개 관측값을 데이터 주기에 맞춰 표시합니다.",
+    )
+    if not market_frames:
+        st.info(market_error or "외부 시장지표를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")
+    else:
+        market_name_to_id = {
+            MARKET_SERIES[series_id]["name"]: series_id for series_id in market_frames
+        }
+        monitor_control, monitor_range = st.columns([2, 3])
+        with monitor_control:
+            selected_market_name = st.selectbox(
+                "시장 지표",
+                list(market_name_to_id),
+                key="market_monitor_series",
+            )
+        with monitor_range:
+            market_window = st.radio(
+                "시장지표 조회 구간",
+                ["6M", "1Y", "3Y", "ALL"],
+                index=1,
+                horizontal=True,
+                label_visibility="collapsed",
+                key="market_monitor_window",
+            )
+
+        selected_market_id = market_name_to_id[selected_market_name]
+        selected_market_meta = MARKET_SERIES[selected_market_id]
+        selected_snapshot = market_snapshots[selected_market_id]
+        stat_values = [
+            ("M1", f"Actual · {selected_market_meta['unit']}", format_market_value(selected_market_id, float(selected_snapshot["latest_value"])), str(selected_snapshot["latest_date"]), "neutral"),
+            ("M2", selected_market_meta["change_label"], *format_rate(selected_snapshot.get("change_pct"))),
+            ("M3", "1개월 변화", *format_rate(selected_snapshot.get("month_pct"))),
+            ("M4", "1년 변화", *format_rate(selected_snapshot.get("year_pct"))),
+        ]
+        market_kpis = st.columns(4)
+        for column, stat in zip(market_kpis, stat_values):
+            with column:
+                if stat[0] == "M1":
+                    theme.kpi_card(stat[0], stat[1], stat[2], stat[3], stat[4])
+                else:
+                    theme.kpi_card(stat[0], stat[1], stat[2], "기준 관측값 대비", stat[3])
+
+        selected_market = filter_window(market_frames[selected_market_id], market_window, "date")
+        market_low = float(selected_market["value"].min())
+        market_high = float(selected_market["value"].max())
+        market_span = market_high - market_low
+        market_padding = market_span * .08 if market_span > 0 else max(abs(market_high) * .05, 1)
+        market_floor = market_low - market_padding
+        market_ceiling = market_high + market_padding
+        market_scale = alt.Scale(
+            domain=[market_floor, market_ceiling],
+            zero=False,
+            nice=False,
+        )
+        market_nearest = alt.selection_point(
+            nearest=True,
+            on="pointerover",
+            fields=["date"],
+            empty=False,
+            clear="pointerout",
+        )
+        market_base = alt.Chart(selected_market).encode(
+            x=alt.X("date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=9))
+        )
+        market_area = market_base.mark_area(color=theme.EXPORT, opacity=.08).encode(
+            y=alt.Y(
+                "value:Q",
+                title=selected_market_meta["unit"],
+                scale=market_scale,
+            ),
+            y2=alt.Y2(datum=market_floor),
+        )
+        market_line = market_base.mark_line(color=theme.EXPORT, strokeWidth=2.4).encode(
+            y=alt.Y("value:Q", title=selected_market_meta["unit"], scale=market_scale),
+            tooltip=[
+                alt.Tooltip("date:T", title="관측일", format="%Y.%m.%d"),
+                alt.Tooltip("value:Q", title=selected_market_name, format=selected_market_meta["format"]),
+            ],
+        )
+        market_selectors = market_base.mark_point(opacity=0).add_params(market_nearest)
+        market_points = market_line.mark_point(size=68, filled=True).encode(
+            opacity=alt.condition(market_nearest, alt.value(1), alt.value(0))
+        )
+        market_rule = market_base.mark_rule(color=theme.INK, opacity=.24).encode(
+            opacity=alt.condition(market_nearest, alt.value(.45), alt.value(0))
+        ).transform_filter(market_nearest)
+        latest_market_point = selected_market.tail(1)
+        market_last_point = alt.Chart(latest_market_point).mark_point(
+            color=theme.BRAND_RED, size=75, filled=True
+        ).encode(x="date:T", y="value:Q")
+        market_last_label = alt.Chart(latest_market_point).mark_text(
+            align="left", dx=8, color=theme.BRAND_RED, font="IBM Plex Mono", fontSize=11
+        ).encode(
+            x="date:T",
+            y="value:Q",
+            text=alt.Text("value:Q", format=selected_market_meta["format"]),
+        )
+        market_chart = (
+            market_area
+            + market_line
+            + market_selectors
+            + market_points
+            + market_rule
+            + market_last_point
+            + market_last_label
+        ).properties(height=310, padding={"right": 54})
+        st.altair_chart(chart_style(market_chart), width="stretch")
+        st.caption(
+            f"Source: FRED · {selected_market_meta['description']} · "
+            f"{selected_market_meta['frequency']} · 최신 관측 {selected_snapshot['latest_date']} · 변동 확인용 집중 축"
+        )
 
 with amount_tab:
     chart_col, insight_col = st.columns([2.15, 1], gap="large")
@@ -702,6 +1079,7 @@ with method_tab:
             - **kg당 신고단가**: 신고금액 ÷ 신고중량
             - **최근 12개월 증감률**: 최근 12개월 합계와 직전 12개월 합계 비교
             - 화면의 금액은 관세청 신고금액이며 KCC글라스의 회계상 매출액과는 다릅니다.
+            - **비교지수**: 선택 구간의 첫 유효 관측값을 100으로 환산한 상대 변화입니다.
             """
         )
     with method_right:
@@ -713,13 +1091,15 @@ with method_tab:
             - HS 2·4단위 조회는 여러 세부 품목을 포함하므로 월별로 합산합니다.
             - 최근 1~2개월 수치는 신고 정정과 반영 시차로 변경될 수 있습니다.
             - 신고단가는 품질, 규격, 운임, 환율과 품목 구성 변화의 영향을 함께 받습니다.
+            - FRED 시장지표는 환율·유가가 일간, 주택착공이 월간이며 동일 시점의 실시간 값이 아닙니다.
+            - 시장 신호는 규칙 기반 보조 해석이며 인과관계나 미래 실적을 의미하지 않습니다.
             """
         )
     st.info("이 대시보드는 시장 탐색과 1차 판단을 위한 도구입니다. 투자·계약 판단 전에는 원자료와 품목 분류를 재확인하세요.")
 
 st.markdown(
-    "<div class='source-note'>SOURCE · 공공데이터포털 / 관세청 품목별 국가별 수출입실적 &nbsp;·&nbsp; "
-    "REFRESH · 통상 매월 15일경 전월분 현행화 &nbsp;·&nbsp; "
-    "METHOD · 월별 행 집계, 총계 행 제외, 무역수지 재계산</div>",
+    "<div class='source-note'>SOURCE · 공공데이터포털 / 관세청 품목별 국가별 수출입실적 · FRED 시장지표 &nbsp;·&nbsp; "
+    "REFRESH · 무역 월간 / 외부지표 6시간 캐시, 지표별 일간·월간 관측 &nbsp;·&nbsp; "
+    "METHOD · 월별 행 집계, 총계 행 제외, 무역수지 재계산, 비교구간 시작=100</div>",
     unsafe_allow_html=True,
 )

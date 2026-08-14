@@ -99,6 +99,65 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
 }}
 .status-dot {{ width: 8px; height: 8px; flex: 0 0 auto; margin-top: 5px; border-radius: 50%; background: var(--import); }}
 
+.market-tape {{
+    position: relative; overflow: hidden; margin: -6px 0 24px; border: 1px solid #263A54;
+    border-radius: 10px; background: #0D1A2B; box-shadow: 0 8px 24px rgba(13,26,43,.13);
+}}
+.market-tape::before, .market-tape::after {{
+    content: ''; position: absolute; z-index: 2; top: 0; bottom: 0; width: 28px; pointer-events: none;
+}}
+.market-tape::before {{ left: 0; background: linear-gradient(90deg, #0D1A2B, transparent); }}
+.market-tape::after {{ right: 0; background: linear-gradient(270deg, #0D1A2B, transparent); }}
+.market-tape-track {{ display: flex; width: max-content; animation: market-scroll 38s linear infinite; }}
+.market-tape:hover .market-tape-track {{ animation-play-state: paused; }}
+.market-tape-set {{ display: flex; align-items: stretch; flex: 0 0 auto; }}
+.ticker-item {{
+    display: grid; grid-template-columns: auto auto; column-gap: 12px; align-content: center;
+    min-width: 205px; padding: 13px 18px; border-right: 1px solid rgba(255,255,255,.13);
+}}
+.ticker-label {{ color: #AAB8C8; font: 500 10px/1.35 'IBM Plex Mono', monospace; letter-spacing: .06em; text-transform: uppercase; }}
+.ticker-status {{ margin-left: 6px; color: #6F8298; font-size: 8px; letter-spacing: .04em; }}
+.ticker-value {{
+    grid-column: 1; margin-top: 3px; color: #FFFFFF; font: 600 15px/1.2 'IBM Plex Mono', monospace;
+    font-variant-numeric: tabular-nums; animation: quote-flash .9s ease-out 1;
+}}
+.ticker-change {{
+    grid-column: 2; grid-row: 1 / span 2; align-self: center; justify-self: end;
+    font: 600 11px/1.2 'IBM Plex Mono', monospace; white-space: nowrap;
+}}
+.ticker-change.up {{ color: #8EB8FF; }}
+.ticker-change.down {{ color: #E4AD67; }}
+.ticker-change.neutral {{ color: #91A1B3; }}
+
+.market-status-row {{
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin: 3px 0 14px; color: var(--muted); font: 500 10px/1.4 'IBM Plex Mono', monospace;
+}}
+.market-status-left {{ display: flex; align-items: center; gap: 7px; }}
+.market-live-dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: var(--export);
+    box-shadow: 0 0 0 0 rgba(23,61,143,.32); animation: live-pulse 2.4s ease-out infinite;
+}}
+.market-live-dot.offline {{ background: #9AACBA; box-shadow: none; animation: none; }}
+.signal-card {{
+    min-height: 112px; padding: 15px 16px; margin-bottom: 10px; border: 1px solid var(--rule);
+    border-radius: 9px; background: #FFFFFF; border-left: 3px solid var(--export);
+}}
+.signal-card.watch {{ border-left-color: var(--import); }}
+.signal-card.neutral {{ border-left-color: #9AACBA; }}
+.signal-status {{
+    font: 600 9px/1.35 'IBM Plex Mono', monospace; color: var(--export); letter-spacing: .09em;
+    text-transform: uppercase;
+}}
+.signal-card.watch .signal-status {{ color: var(--import); }}
+.signal-card.neutral .signal-status {{ color: var(--muted); }}
+.signal-title {{ margin: 8px 0 4px; color: var(--ink); font-size: 14px; font-weight: 700; }}
+.signal-copy {{ color: var(--muted); font-size: 11px; line-height: 1.55; }}
+
+@keyframes market-scroll {{ from {{ transform: translateX(0); }} to {{ transform: translateX(-50%); }} }}
+@keyframes quote-flash {{ 0% {{ color: #FFFFFF; }} 35% {{ color: #8EB8FF; text-shadow: 0 0 8px rgba(142,184,255,.55); }} 100% {{ color: #FFFFFF; }} }}
+@keyframes live-pulse {{ 0% {{ box-shadow: 0 0 0 0 rgba(23,61,143,.34); }} 70% {{ box-shadow: 0 0 0 7px rgba(23,61,143,0); }} 100% {{ box-shadow: 0 0 0 0 rgba(23,61,143,0); }} }}
+
 .section-title {{ margin: 6px 0 16px; }}
 .section-title h2 {{ margin: 0 0 5px; font-size: 20px; color: var(--ink); letter-spacing: -.025em; }}
 .section-title p {{ margin: 0; font-size: 13px; color: var(--muted); }}
@@ -161,6 +220,9 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
     .trust-item:nth-child(2) {{ border-right: none; }}
     .trust-item:nth-child(-n+2) {{ border-bottom: 1px solid var(--rule); }}
     .kpi-card {{ min-height: 126px; margin-bottom: 8px; }}
+    .market-tape {{ margin-top: 0; }}
+    .ticker-item {{ min-width: 178px; padding: 12px 15px; }}
+    .market-status-row {{ align-items: flex-start; flex-direction: column; }}
 }}
 
 @media (prefers-reduced-motion: reduce) {{ * {{ animation: none !important; transition: none !important; }} }}
@@ -208,6 +270,38 @@ def insight_card(kicker: str, title: str, copy: str) -> None:
         f"<div class='insight-kicker'>{esc(kicker)}</div>"
         f"<div class='insight-title'>{esc(title)}</div>"
         f"<div class='insight-copy'>{esc(copy)}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def market_tape(items: list[dict[str, str]]) -> None:
+    """최신값·변화율·데이터 주기를 흐르는 시장 테이프로 표시한다."""
+    cells = "".join(
+        "<div class='ticker-item'>"
+        f"<div class='ticker-label'>{esc(item['label'])}"
+        f"<span class='ticker-status'>{esc(item['status'])}</span></div>"
+        f"<div class='ticker-value'>{esc(item['value'])}</div>"
+        f"<div class='ticker-change {esc(item.get('tone', 'neutral'))}'>{esc(item['change'])}</div>"
+        "</div>"
+        for item in items
+    )
+    st.markdown(
+        "<div class='market-tape'><div class='market-tape-track'>"
+        f"<div class='market-tape-set'>{cells}</div>"
+        f"<div class='market-tape-set' aria-hidden='true'>{cells}</div>"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def signal_card(status: str, title: str, copy: str, tone: str = "positive") -> None:
+    tone_class = "watch" if tone == "negative" else "neutral" if tone == "neutral" else ""
+    st.markdown(
+        f"<div class='signal-card {tone_class}'>"
+        f"<div class='signal-status'>{esc(status)}</div>"
+        f"<div class='signal-title'>{esc(title)}</div>"
+        f"<div class='signal-copy'>{esc(copy)}</div>"
         "</div>",
         unsafe_allow_html=True,
     )

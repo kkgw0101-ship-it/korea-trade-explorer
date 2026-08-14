@@ -10,6 +10,11 @@
 - KCC글라스 공식 국문 풀컬러 CI와 브랜드 컬러 적용
 - 금액(USD)과 중량(kg)을 분리한 월별 수출입 추이
 - 금액·중량 전년동월 증감률, 무역수지, kg당 신고단가 시각화
+- Market Pulse 시세 테이프와 데이터 주기별 상태 표시
+- 금액·중량·단가를 시작시점 100으로 환산한 모멘텀 비교
+- FRED 기반 원/달러 환율·WTI·미국 주택착공 모니터
+- 6M·1Y·3Y·전체 기간 선택, 십자선 툴팁, 최신값 라벨
+- 외부 시장지표 장애 시 관세청 분석을 유지하는 안전한 폴백
 - 월별 집계와 API 원자료 분리 조회 및 CSV 다운로드
 - 데이터 출처, 단위, 갱신 주기, 지표 정의를 화면에 명시
 - API 필드 누락과 세부 품목 중복 월을 안전하게 처리
@@ -53,6 +58,7 @@ python -m unittest discover -s tests -v
 ```text
 app.py               Streamlit 화면과 상호작용
 trade_data.py        API 조회, 응답 정규화, 월별 집계, KPI 계산
+market_data.py       FRED 공개 시장지표 조회, ZIP/CSV 파싱, 변화율 계산
 theme.py             디자인 토큰과 UI 컴포넌트
 assets/              KCC글라스 공식 브랜드 자산
 sample_data.py       데모용 재현 가능한 샘플 시계열
@@ -61,4 +67,6 @@ country_codes.py     상대국 코드
 tests/               데이터 계층 회귀 테스트
 ```
 
-데이터 출처: [공공데이터포털](https://www.data.go.kr/) · [관세청 무역통계](https://tradedata.go.kr/)
+외부 시장지표는 6시간 캐시되며 원/달러·WTI는 일간, 미국 주택착공은 월간 관측입니다. 최신 관측일은 지표별로 다를 수 있습니다.
+
+데이터 출처: [공공데이터포털](https://www.data.go.kr/) · [관세청 무역통계](https://tradedata.go.kr/) · [FRED](https://fred.stlouisfed.org/)
