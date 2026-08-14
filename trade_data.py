@@ -225,6 +225,8 @@ def analysis_summary(periods: pd.DataFrame) -> dict[str, float | int | str | Non
         return {}
     total_export = float(periods["export_usd"].sum())
     total_import = float(periods["import_usd"].sum())
+    total_export_wgt = float(periods["export_wgt"].sum())
+    total_import_wgt = float(periods["import_wgt"].sum())
     latest = periods.iloc[-1]
     prior = periods.iloc[-2] if len(periods) >= 2 else None
     yoy = periods.iloc[-13] if len(periods) >= 13 else None
@@ -235,18 +237,31 @@ def analysis_summary(periods: pd.DataFrame) -> dict[str, float | int | str | Non
         "total_export": total_export,
         "total_import": total_import,
         "balance": total_export - total_import,
+        "total_export_wgt": total_export_wgt,
+        "total_import_wgt": total_import_wgt,
         "latest_period": str(latest["label"]),
         "latest_export": float(latest["export_usd"]),
         "latest_import": float(latest["import_usd"]),
+        "latest_export_wgt": float(latest["export_wgt"]),
+        "latest_import_wgt": float(latest["import_wgt"]),
         "export_mom": percent_change(float(latest["export_usd"]), float(prior["export_usd"])) if prior is not None else None,
         "export_yoy": percent_change(float(latest["export_usd"]), float(yoy["export_usd"])) if yoy is not None else None,
+        "export_wgt_mom": percent_change(float(latest["export_wgt"]), float(prior["export_wgt"])) if prior is not None else None,
+        "export_wgt_yoy": percent_change(float(latest["export_wgt"]), float(yoy["export_wgt"])) if yoy is not None else None,
         "recent_12_export": float(recent_12["export_usd"].sum()),
         "recent_12_growth": percent_change(
             float(recent_12["export_usd"].sum()),
             float(previous_12["export_usd"].sum()),
         ) if not previous_12.empty else None,
+        "recent_12_export_wgt": float(recent_12["export_wgt"].sum()),
+        "recent_12_import_wgt": float(recent_12["import_wgt"].sum()),
+        "recent_12_wgt_growth": percent_change(
+            float(recent_12["export_wgt"].sum()),
+            float(previous_12["export_wgt"].sum()),
+        ) if not previous_12.empty else None,
         "deficit_months": int((periods["balance_usd"] < 0).sum()),
         "peak_export_period": str(periods.loc[periods["export_usd"].idxmax(), "label"]),
         "peak_export": float(periods["export_usd"].max()),
+        "peak_export_wgt_period": str(periods.loc[periods["export_wgt"].idxmax(), "label"]),
+        "peak_export_wgt": float(periods["export_wgt"].max()),
     }
-

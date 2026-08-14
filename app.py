@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from datetime import date, timedelta
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
@@ -46,6 +47,16 @@ def format_money(value: float) -> str:
     return f"${value:,.0f}"
 
 
+def format_weight(value: float) -> str:
+    tonnes = value / 1_000
+    absolute = abs(tonnes)
+    if absolute >= 1_000_000:
+        return f"{tonnes / 1_000_000:,.2f}M t"
+    if absolute >= 1_000:
+        return f"{tonnes / 1_000:,.1f}K t"
+    return f"{tonnes:,.1f} t"
+
+
 def format_rate(value: float | None, *, prefix: str = "") -> tuple[str, str]:
     if value is None:
         return "비교 기간 부족", "neutral"
@@ -59,6 +70,27 @@ def get_deployed_key() -> str:
         return str(st.secrets.get("DATA_GO_KR_SERVICE_KEY", "")).strip()
     except Exception:
         return ""
+
+
+def chart_style(chart: alt.Chart) -> alt.Chart:
+    """모든 분석 차트에 동일한 KCC글라스 시각 규칙을 적용한다."""
+    return (
+        chart.configure_axis(
+            labelColor=theme.MUTED,
+            titleColor=theme.MUTED,
+            gridColor="#E6EBF1",
+            domainColor="#C9D2DE",
+            tickColor="#C9D2DE",
+            labelFont="IBM Plex Sans KR",
+            titleFont="IBM Plex Sans KR",
+        )
+        .configure_legend(
+            labelColor=theme.MUTED,
+            labelFont="IBM Plex Sans KR",
+            symbolStrokeWidth=3,
+        )
+        .configure_view(strokeWidth=0)
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -107,9 +139,17 @@ today = date.today()
 latest_complete = previous_month(today)
 default_start_year = max(2000, latest_complete.year - 2)
 deployed_key = get_deployed_key()
+logo_uri = theme.asset_data_uri(
+    Path(__file__).resolve().parent / "assets" / "kcc_glass_logo_fullcolor.svg"
+)
 
 with st.sidebar:
-    st.markdown("<div class='sidebar-brand'>TRADE / INTELLIGENCE</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='sidebar-brand'>"
+        f"<img class='sidebar-logo' src='{logo_uri}' alt='KCC글라스'>"
+        "<span>TRADE INTELLIGENCE PLATFORM</span></div>",
+        unsafe_allow_html=True,
+    )
     st.markdown("### 분석 조건")
     st.caption("품목·상대국·기간을 설정하고 월별 통관실적을 분석합니다.")
 
@@ -148,9 +188,11 @@ with st.sidebar:
         supplied_key = st.text_input(
             "공공데이터포털 인증키",
             type="password",
-            placeholder="배포 환경에 키가 없을 때만 입력",
-            disabled=data_mode == "샘플로 둘러보기",
-            help="일반 인증키(Decoding)를 사용합니다. 입력값은 세션 밖에 저장하지 않습니다.",
+            placeholder="일반 인증키(Decoding)를 붙여 넣으세요",
+            help=(
+                "샘플 모드에서도 키를 입력하면 실제 API 조회가 우선됩니다. "
+                "입력값은 세션 밖에 저장하지 않습니다."
+            ),
         )
         submitted = st.form_submit_button("분석 실행", type="primary", width="stretch")
 
@@ -174,7 +216,7 @@ if submitted:
         st.sidebar.error("HS Code는 숫자 2·4·6·10자리로 입력해 주세요.")
     elif start_ym > end_ym:
         st.sidebar.error("시작 시점이 종료 시점보다 늦습니다.")
-    elif data_mode == "관세청 API 조회":
+    elif data_mode == "관세청 API 조회" or supplied_key.strip():
         active_key = supplied_key.strip() or deployed_key
         if not active_key:
             st.sidebar.error("API 조회에는 공공데이터포털 인증키가 필요합니다.")
@@ -230,19 +272,20 @@ meta = st.session_state["meta"]
 is_demo = st.session_state["demo"]
 
 st.markdown(
-    """
+    f"""
     <div class="masthead">
       <div class="brand-lockup">
-        <div class="masthead-mark">KT</div>
+        <img class="masthead-logo" src="{logo_uri}" alt="KCC글라스">
+        <div class="brand-divider"></div>
         <div>
-          <div class="eyebrow">Korea Trade Intelligence</div>
-          <h1>한국 수출입 무역 인텔리전스</h1>
-          <p>관세청 통관실적을 품목·시장·시간 관점에서 읽는 월별 분석 대시보드</p>
+          <div class="eyebrow">Global Market Analytics</div>
+          <h1>Trade Intelligence Platform</h1>
+          <p>관세청 통관실적을 금액·물량·단가 관점에서 읽는 월별 수출입 분석 플랫폼</p>
         </div>
       </div>
       <div class="masthead-meta">
         <div class="eyebrow">Decision support</div>
-        <div class="meta-copy">시장 모니터링 · 사업 검토 · 원자료 추출</div>
+        <div class="meta-copy">시장 모니터링 · 물량 진단 · 가격 포지셔닝</div>
       </div>
     </div>
     """,
@@ -255,7 +298,7 @@ st.markdown(
     "<div class='trust-item'><div class='trust-label'>Source</div><div class='trust-value'>관세청 통관실적</div></div>"
     f"<div class='trust-item'><div class='trust-label'>Coverage</div><div class='trust-value'>{theme.esc(coverage)}</div></div>"
     "<div class='trust-item'><div class='trust-label'>Grain</div><div class='trust-value'>월별 · HS Code</div></div>"
-    "<div class='trust-item'><div class='trust-label'>Units</div><div class='trust-value'>USD · kg</div></div>"
+    "<div class='trust-item'><div class='trust-label'>Lenses</div><div class='trust-value'>금액 · 중량 · 단가</div></div>"
     "</div>",
     unsafe_allow_html=True,
 )
@@ -283,28 +326,33 @@ growth_note, growth_tone = format_rate(summary["recent_12_growth"], prefix="직�
 mom_note, mom_tone = format_rate(summary["export_mom"], prefix="전월 대비 ")
 balance_tone = "positive" if summary["balance"] >= 0 else "negative"
 
+st.markdown(
+    "<div class='analysis-band'><strong>금액 성과 요약</strong>"
+    "<span>VALUE LENS · CUSTOMS DECLARED VALUE</span></div>",
+    unsafe_allow_html=True,
+)
 kpi_cols = st.columns(4)
 with kpi_cols[0]:
-    theme.kpi_card("01", "수출 누계", format_money(summary["total_export"]), growth_note, growth_tone)
+    theme.kpi_card("01", "수출 신고금액 누계", format_money(summary["total_export"]), growth_note, growth_tone)
 with kpi_cols[1]:
-    theme.kpi_card("02", "수입 누계", format_money(summary["total_import"]), "조회 기간 합계")
+    theme.kpi_card("02", "수입 신고금액 누계", format_money(summary["total_import"]), "조회 기간 합계")
 with kpi_cols[2]:
     balance_label = "흑자" if summary["balance"] >= 0 else "적자"
     theme.kpi_card("03", "무역수지", format_money(summary["balance"]), balance_label, balance_tone)
 with kpi_cols[3]:
-    theme.kpi_card("04", f"최근 월 수출 · {summary['latest_period']}", format_money(summary["latest_export"]), mom_note, mom_tone)
+    theme.kpi_card("04", f"최근 월 수출금액 · {summary['latest_period']}", format_money(summary["latest_export"]), mom_note, mom_tone)
 
 st.write("")
-overview_tab, balance_tab, data_tab, method_tab = st.tabs(
-    ["시장 흐름", "수지 · 단가", "데이터", "해석 기준"]
+amount_tab, weight_tab, balance_tab, data_tab, method_tab = st.tabs(
+    ["금액 분석", "중량 분석", "수지 · 단가", "데이터", "해석 기준"]
 )
 
-with overview_tab:
+with amount_tab:
     chart_col, insight_col = st.columns([2.15, 1], gap="large")
     with chart_col:
-        st.markdown("<div class='chart-heading'>월별 수출입 금액 추이</div>", unsafe_allow_html=True)
+        st.markdown("<div class='chart-heading'>월별 수출입 신고금액 추이</div>", unsafe_allow_html=True)
         st.markdown(
-            "<div class='chart-subtitle'>동일 축 비교 · 실선은 수출, 파선은 수입 · 단위 USD</div>",
+            "<div class='chart-subtitle'>관세청 신고금액 기준 · 실선은 수출, 파선은 수입 · 단위 USD</div>",
             unsafe_allow_html=True,
         )
         trend_long = periods.melt(
@@ -338,7 +386,7 @@ with overview_tab:
             )
             .properties(height=350)
         )
-        st.altair_chart(trend_chart, width="stretch")
+        st.altair_chart(chart_style(trend_chart), width="stretch")
 
     with insight_col:
         st.markdown("<div class='chart-heading'>핵심 관찰</div>", unsafe_allow_html=True)
@@ -359,6 +407,158 @@ with overview_tab:
             f"적자 월 {summary['deficit_months']}개",
             f"전체 {summary['months']}개월 중 무역수지가 0 미만인 월의 수입니다.",
         )
+
+    amount_yoy = periods[["period_date", "label", "export_usd"]].copy()
+    amount_yoy["yoy"] = amount_yoy["export_usd"].pct_change(12) * 100
+    amount_yoy = amount_yoy.dropna(subset=["yoy"])
+    if not amount_yoy.empty:
+        st.markdown("<div class='chart-heading'>수출 신고금액 전년동월 증감률</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='chart-subtitle'>계절성을 통제한 월별 성장 모멘텀 · 단위 %</div>",
+            unsafe_allow_html=True,
+        )
+        amount_yoy_chart = (
+            alt.Chart(amount_yoy)
+            .mark_bar(size=12, cornerRadiusEnd=2)
+            .encode(
+                x=alt.X("period_date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=9)),
+                y=alt.Y("yoy:Q", title="전년동월 대비 (%)"),
+                color=alt.condition("datum.yoy >= 0", alt.value(theme.EXPORT), alt.value(theme.IMPORT)),
+                tooltip=[
+                    alt.Tooltip("label:N", title="기간"),
+                    alt.Tooltip("yoy:Q", title="증감률", format="+.1f"),
+                ],
+            )
+            .properties(height=190)
+        )
+        amount_zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=theme.INK, opacity=.4).encode(y="y:Q")
+        st.altair_chart(chart_style(amount_yoy_chart + amount_zero), width="stretch")
+
+with weight_tab:
+    weight_growth_note, weight_growth_tone = format_rate(
+        summary["recent_12_wgt_growth"], prefix="직전 12개월 대비 "
+    )
+    weight_mom_note, weight_mom_tone = format_rate(
+        summary["export_wgt_mom"], prefix="전월 대비 "
+    )
+    st.markdown(
+        "<div class='analysis-band'><strong>물량 성과 요약</strong>"
+        "<span>VOLUME LENS · DECLARED NET WEIGHT</span></div>",
+        unsafe_allow_html=True,
+    )
+    weight_kpis = st.columns(4)
+    with weight_kpis[0]:
+        theme.kpi_card(
+            "V1", "수출 중량 누계", format_weight(summary["total_export_wgt"]),
+            weight_growth_note, weight_growth_tone,
+        )
+    with weight_kpis[1]:
+        theme.kpi_card(
+            "V2", "수입 중량 누계", format_weight(summary["total_import_wgt"]), "조회 기간 합계"
+        )
+    with weight_kpis[2]:
+        theme.kpi_card(
+            "V3", f"최근 월 수출중량 · {summary['latest_period']}",
+            format_weight(summary["latest_export_wgt"]), weight_mom_note, weight_mom_tone,
+        )
+    with weight_kpis[3]:
+        theme.kpi_card(
+            "V4", f"최근 월 수입중량 · {summary['latest_period']}",
+            format_weight(summary["latest_import_wgt"]), "신고 순중량 기준",
+        )
+
+    st.write("")
+    weight_chart_col, weight_insight_col = st.columns([2.15, 1], gap="large")
+    with weight_chart_col:
+        st.markdown("<div class='chart-heading'>월별 수출입 중량 추이</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='chart-subtitle'>신고 순중량 기준 · 실선은 수출, 파선은 수입 · 단위 kg</div>",
+            unsafe_allow_html=True,
+        )
+        weight_long = periods.melt(
+            id_vars=["period_date", "label"],
+            value_vars=["export_wgt", "import_wgt"],
+            var_name="flow_key",
+            value_name="weight",
+        )
+        weight_long["구분"] = weight_long["flow_key"].map(
+            {"export_wgt": "수출 중량", "import_wgt": "수입 중량"}
+        )
+        weight_chart = (
+            alt.Chart(weight_long)
+            .mark_line(strokeWidth=2.5)
+            .encode(
+                x=alt.X("period_date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=8)),
+                y=alt.Y("weight:Q", title="중량 (kg)", axis=alt.Axis(format="~s"), scale=alt.Scale(zero=True)),
+                color=alt.Color(
+                    "구분:N",
+                    scale=alt.Scale(
+                        domain=["수출 중량", "수입 중량"], range=[theme.EXPORT, theme.IMPORT]
+                    ),
+                    legend=alt.Legend(title=None, orient="top", direction="horizontal"),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "구분:N",
+                    scale=alt.Scale(domain=["수출 중량", "수입 중량"], range=[[1, 0], [6, 4]]),
+                    legend=None,
+                ),
+                tooltip=[
+                    alt.Tooltip("label:N", title="기간"),
+                    alt.Tooltip("구분:N"),
+                    alt.Tooltip("weight:Q", title="중량(kg)", format=",.0f"),
+                ],
+            )
+            .properties(height=350)
+        )
+        st.altair_chart(chart_style(weight_chart), width="stretch")
+
+    with weight_insight_col:
+        st.markdown("<div class='chart-heading'>물량 관찰</div>", unsafe_allow_html=True)
+        st.markdown("<div class='chart-subtitle'>금액과 분리한 실물 흐름 진단</div>", unsafe_allow_html=True)
+        weight_yoy_text, _ = format_rate(summary["export_wgt_yoy"])
+        latest_unit = periods.iloc[-1]["export_unit_usd"]
+        latest_unit_text = f"${latest_unit:,.2f}/kg" if pd.notna(latest_unit) else "산출 불가"
+        theme.insight_card(
+            "Volume momentum",
+            f"최근 월 수출중량 {weight_yoy_text}",
+            "전년 동월과 비교해 계절성을 반영한 물량 방향을 확인합니다.",
+        )
+        theme.insight_card(
+            "Volume peak",
+            f"수출중량 고점 {summary['peak_export_wgt_period']}",
+            f"월 수출중량 {format_weight(summary['peak_export_wgt'])}로 조회 기간 중 가장 높았습니다.",
+        )
+        theme.insight_card(
+            "Unit value",
+            f"최근 월 수출 신고단가 {latest_unit_text}",
+            "금액 변화가 물량 또는 단가 중 어디에서 발생했는지 함께 해석합니다.",
+        )
+
+    weight_yoy = periods[["period_date", "label", "export_wgt"]].copy()
+    weight_yoy["yoy"] = weight_yoy["export_wgt"].pct_change(12) * 100
+    weight_yoy = weight_yoy.dropna(subset=["yoy"])
+    if not weight_yoy.empty:
+        st.markdown("<div class='chart-heading'>수출 중량 전년동월 증감률</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='chart-subtitle'>실물 물동량의 월별 성장 모멘텀 · 단위 %</div>",
+            unsafe_allow_html=True,
+        )
+        weight_yoy_chart = (
+            alt.Chart(weight_yoy)
+            .mark_bar(size=12, cornerRadiusEnd=2)
+            .encode(
+                x=alt.X("period_date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=9)),
+                y=alt.Y("yoy:Q", title="전년동월 대비 (%)"),
+                color=alt.condition("datum.yoy >= 0", alt.value(theme.EXPORT), alt.value(theme.IMPORT)),
+                tooltip=[
+                    alt.Tooltip("label:N", title="기간"),
+                    alt.Tooltip("yoy:Q", title="증감률", format="+.1f"),
+                ],
+            )
+            .properties(height=190)
+        )
+        weight_zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=theme.INK, opacity=.4).encode(y="y:Q")
+        st.altair_chart(chart_style(weight_yoy_chart + weight_zero), width="stretch")
 
 with balance_tab:
     left_chart, right_chart = st.columns(2, gap="large")
@@ -385,7 +585,7 @@ with balance_tab:
             .properties(height=330)
         )
         zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=theme.INK, opacity=.45).encode(y="y:Q")
-        st.altair_chart(balance_chart + zero_rule, width="stretch")
+        st.altair_chart(chart_style(balance_chart + zero_rule), width="stretch")
 
     with right_chart:
         st.markdown("<div class='chart-heading'>kg당 신고단가 추이</div>", unsafe_allow_html=True)
@@ -431,7 +631,7 @@ with balance_tab:
                 )
                 .properties(height=330)
             )
-            st.altair_chart(unit_chart, width="stretch")
+            st.altair_chart(chart_style(unit_chart), width="stretch")
 
 with data_tab:
     theme.section_title("조회 데이터", "분석용 월 집계와 API 원자료를 구분해 확인하고 내려받을 수 있습니다.")
@@ -501,6 +701,7 @@ with method_tab:
             - **무역수지**: 수출액 − 수입액
             - **kg당 신고단가**: 신고금액 ÷ 신고중량
             - **최근 12개월 증감률**: 최근 12개월 합계와 직전 12개월 합계 비교
+            - 화면의 금액은 관세청 신고금액이며 KCC글라스의 회계상 매출액과는 다릅니다.
             """
         )
     with method_right:

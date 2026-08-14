@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import html
+from pathlib import Path
 
 import streamlit as st
 
 
-INK = "#12263A"
-NAVY = "#163A5F"
-EXPORT = "#087F8C"
-IMPORT = "#C46A2D"
-SKY = "#DCEAF4"
+INK = "#12213B"
+NAVY = "#102A83"
+EXPORT = "#173D8F"
+IMPORT = "#B8752B"
+BRAND_RED = "#E5242A"
+SKY = "#E1E8F5"
 PAPER = "#F7F9FB"
 PANEL = "#EEF3F6"
 RULE = "#D7E0E6"
@@ -23,7 +26,7 @@ _CSS = f"""
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap');
 
 :root {{
-    --ink: {INK}; --navy: {NAVY}; --export: {EXPORT}; --import: {IMPORT};
+    --ink: {INK}; --navy: {NAVY}; --export: {EXPORT}; --import: {IMPORT}; --brand-red: {BRAND_RED};
     --paper: {PAPER}; --panel: {PANEL}; --rule: {RULE}; --muted: {MUTED};
 }}
 
@@ -62,13 +65,8 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
 }}
 .brand-lockup {{ display: flex; align-items: center; gap: 16px; min-width: 0; }}
 .brand-lockup > div:last-child {{ min-width: 0; }}
-.masthead-mark {{
-    display: grid; place-items: center; width: 48px; height: 48px;
-    flex: 0 0 48px;
-    font: 600 17px/1 'IBM Plex Mono', monospace; letter-spacing: .05em;
-    color: white; background: var(--navy); border-radius: 11px;
-    box-shadow: 0 7px 20px rgba(22,58,95,.18);
-}}
+.masthead-logo {{ width: 166px; height: auto; display: block; flex: 0 0 166px; }}
+.brand-divider {{ width: 1px; height: 48px; flex: 0 0 1px; background: var(--rule); }}
 .masthead h1 {{ margin: 0 0 4px; color: var(--ink); font-size: clamp(24px, 3vw, 32px); letter-spacing: -.035em; }}
 .masthead p {{ margin: 0; color: var(--muted); font-size: 13px; }}
 .masthead-meta {{ text-align: right; }}
@@ -77,6 +75,13 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
     color: var(--export); margin-bottom: 6px;
 }}
 .meta-copy {{ color: var(--muted); font-size: 12px; }}
+.analysis-band {{
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    margin: 2px 0 14px; padding: 9px 12px; border-left: 3px solid var(--navy);
+    background: linear-gradient(90deg, rgba(16,42,131,.055), rgba(16,42,131,0));
+}}
+.analysis-band strong {{ font-size: 12px; color: var(--ink); }}
+.analysis-band span {{ font: 500 10px/1.4 'IBM Plex Mono', monospace; color: var(--muted); letter-spacing: .06em; }}
 
 .trust-strip {{
     display: grid; grid-template-columns: repeat(4, minmax(0,1fr));
@@ -127,9 +132,9 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
     margin-top: 30px; padding-top: 14px; border-top: 1px solid var(--rule);
     font: 400 10px/1.6 'IBM Plex Mono', monospace; color: var(--muted);
 }}
-.sidebar-brand {{
-    padding: 4px 0 13px; font: 600 12px/1.4 'IBM Plex Mono', monospace; letter-spacing: .06em; color: var(--navy);
-}}
+.sidebar-brand {{ padding: 3px 0 15px; }}
+.sidebar-logo {{ display: block; width: 176px; height: auto; margin-bottom: 8px; }}
+.sidebar-brand span {{ font: 600 10px/1.4 'IBM Plex Mono', monospace; letter-spacing: .11em; color: var(--navy); }}
 .sidebar-help {{
     padding: 11px 12px; border: 1px solid var(--rule); border-radius: 8px;
     background: rgba(255,255,255,.62); color: var(--muted); font-size: 11px; line-height: 1.55;
@@ -145,9 +150,10 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
 @media (max-width: 760px) {{
     .block-container {{ padding-top: 4rem; }}
     .masthead {{ align-items: flex-start; }}
-    .brand-lockup {{ align-items: flex-start; gap: 12px; width: 100%; }}
+    .brand-lockup {{ display: block; width: 100%; }}
     .masthead-meta {{ display: none; }}
-    .masthead-mark {{ width: 42px; height: 42px; flex-basis: 42px; }}
+    .masthead-logo {{ width: 150px; margin-bottom: 18px; }}
+    .brand-divider {{ display: none; }}
     .masthead h1 {{ font-size: 27px; line-height: 1.22; word-break: keep-all; overflow-wrap: normal; }}
     .masthead p {{ line-height: 1.65; word-break: keep-all; }}
     .section-title h2 {{ font-size: 19px; line-height: 1.45; word-break: keep-all; }}
@@ -168,6 +174,12 @@ def inject() -> None:
 
 def esc(value: object) -> str:
     return html.escape(str(value), quote=True)
+
+
+def asset_data_uri(path: str | Path, mime: str = "image/svg+xml") -> str:
+    """로컬 브랜드 자산을 배포 가능한 data URI로 변환한다."""
+    payload = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{payload}"
 
 
 def section_title(title: str, subtitle: str) -> None:
