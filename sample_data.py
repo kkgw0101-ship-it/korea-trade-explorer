@@ -24,7 +24,7 @@ def _months(start_ym, end_ym):
     return out
 
 
-def build(start_ym, end_ym, hs_code):
+def build(start_ym, end_ym, hs_code, country_name="샘플 국가"):
     """계절성과 완만한 추세를 섞은 가짜 시계열을 만든다."""
     rng = random.Random(hs_code or "sample")
     periods = _months(start_ym, end_ym)
@@ -49,7 +49,7 @@ def build(start_ym, end_ym, hs_code):
                 "period": period,
                 "hs_cd": hs_code,
                 "item_name": "샘플 품목",
-                "country": "샘플 국가",
+                "country": country_name,
                 "export_usd": round(export, 0),
                 "export_wgt": round(export / (export_unit * rng.uniform(0.95, 1.05)), 0),
                 "import_usd": round(imp, 0),

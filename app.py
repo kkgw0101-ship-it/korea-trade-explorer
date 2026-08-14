@@ -73,7 +73,12 @@ def cached_trade(
 
 
 def load_sample(start_ym: str, end_ym: str, hs_code: str, country: str) -> pd.DataFrame:
-    return sample_data.build(start_ym, end_ym, hs_code, country)
+    # 배포 중 app.py와 sample_data.py가 서로 다른 커밋이어도 동작하도록
+    # 기존 3개 인자 API를 사용하고 상대국 표시는 호출부에서 보정한다.
+    frame = sample_data.build(start_ym, end_ym, hs_code).copy()
+    if "country" in frame.columns:
+        frame["country"] = country
+    return frame
 
 
 def set_result(
