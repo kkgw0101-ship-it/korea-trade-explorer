@@ -1,465 +1,519 @@
-"""
-한국 수출입 무역통계 탐색기
-Korea Trade Statistics Explorer
+"""한국 수출입 무역통계 인텔리전스 대시보드."""
 
-관세청 '품목별 국가별 수출입실적' 오픈 API(nitemtrade)를 이용해
-HS Code 기준 수출입 추이를 조회하고 비교하는 개인 프로젝트.
-
-데이터 출처: 공공데이터포털 (data.go.kr) — 관세청_품목별 국가별 수출입실적
-"""
+from __future__ import annotations
 
 import io
-import re
-import time
-import urllib.parse
-import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, timedelta
 
+import altair as alt
 import pandas as pd
-import requests
 import streamlit as st
 
+import sample_data
 import theme
 from country_codes import COUNTRY_CODES
 from hs_presets import HS_PRESETS
-
-API_URL = "https://apis.data.go.kr/1220000/nitemtrade/getNitemtradeList"
-
-# 관세청 응답 필드 → 내부 컬럼명 (기술문서 c) 응답 메시지 명세 기준)
-FIELD_MAP = {
-    "year": "period",              # 기간 — "2016.01" 또는 "총계"
-    "statCdCntnKor1": "country",   # 국가명
-    "statCd": "country_cd",        # 국가코드
-    "statKor": "item_name",        # 품목명
-    "hsCd": "hs_cd",               # HS코드
-    "expWgt": "export_wgt",        # 수출중량 (kg)
-    "expDlr": "export_usd",        # 수출금액 (달러)
-    "impWgt": "import_wgt",        # 수입중량 (kg)
-    "impDlr": "import_usd",        # 수입금액 (달러)
-    "balPayments": "balance_usd",  # 무역수지 (달러)
-}
-
-NUMERIC_COLS = ["export_wgt", "export_usd", "import_wgt", "import_usd", "balance_usd"]
-
-PERIOD_RE = re.compile(r"^(\d{4})[.\-/]?(\d{2})$")
+from trade_data import (
+    TradeDataError,
+    analysis_summary,
+    fetch_trade,
+    normalize_key,
+    prepare_periods,
+)
 
 
-# ─────────────────────────────────────────────────────────────
-# 데이터 조회
-# ─────────────────────────────────────────────────────────────
-
-def normalize_key(raw_key):
-    """
-    인증키가 이미 URL 인코딩된 상태(%2F, %2B 등)면 원래 값으로 되돌린다.
-    requests가 파라미터를 다시 인코딩하므로, 인코딩된 키를 그대로 넘기면
-    %가 %25로 이중 인코딩되어 인증에 실패한다.
-    """
-    key = raw_key.strip()
-    if "%" in key:
-        return urllib.parse.unquote(key)
-    return key
+st.set_page_config(
+    page_title="Korea Trade Intelligence",
+    page_icon="⚓",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
+theme.inject()
 
 
-def _to_number(raw):
-    """관세청 응답의 숫자 문자열을 float으로. 콤마·하이픈·빈값 처리."""
-    if raw is None:
-        return 0.0
-    text = str(raw).strip().replace(",", "")
-    if text in ("", "-", "null", "None"):
-        return 0.0
+def previous_month(today: date) -> date:
+    return date(today.year, today.month, 1) - timedelta(days=1)
+
+
+def format_money(value: float) -> str:
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"${value / 1_000_000_000:,.2f}B"
+    if absolute >= 1_000_000:
+        return f"${value / 1_000_000:,.1f}M"
+    if absolute >= 1_000:
+        return f"${value / 1_000:,.1f}K"
+    return f"${value:,.0f}"
+
+
+def format_rate(value: float | None, *, prefix: str = "") -> tuple[str, str]:
+    if value is None:
+        return "비교 기간 부족", "neutral"
+    sign = "+" if value >= 0 else ""
+    tone = "positive" if value >= 0 else "negative"
+    return f"{prefix}{sign}{value:,.1f}%", tone
+
+
+def get_deployed_key() -> str:
     try:
-        return float(text)
-    except ValueError:
-        return 0.0
-
-
-def parse_response(xml_text):
-    """
-    관세청 XML 응답을 DataFrame으로 변환.
-
-    두 종류의 에러 형식을 모두 확인한다.
-      - 포털 레벨: <OpenAPI_ServiceResponse><cmmMsgHeader><returnReasonCode>
-      - 기관 레벨: <response><header><resultCode>
-    """
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        raise RuntimeError(
-            "응답을 해석하지 못했습니다. 인증키가 올바른지, "
-            "활용 신청이 승인되었는지 확인해 주세요."
-        )
-
-    reason_code = root.findtext(".//returnReasonCode")
-    if reason_code:
-        auth_msg = root.findtext(".//returnAuthMsg") or ""
-        hint = {
-            "30": "등록되지 않은 인증키입니다. 발급 직후라면 반영에 최대 1시간이 걸립니다.",
-            "22": "일일 요청 한도를 넘었습니다.",
-            "31": "활용기간이 만료되었습니다.",
-            "32": "등록되지 않은 IP입니다.",
-        }.get(reason_code.strip(), "")
-        raise RuntimeError(f"[{reason_code.strip()}] {auth_msg} {hint}".strip())
-
-    result_code = root.findtext(".//resultCode")
-    if result_code is not None and result_code.strip() not in ("00", "0"):
-        result_msg = (root.findtext(".//resultMsg") or "").strip()
-        raise RuntimeError(f"[{result_code.strip()}] {result_msg}")
-
-    rows = []
-    for item in root.iter("item"):
-        raw = {child.tag: (child.text or "").strip() for child in item}
-        rows.append({FIELD_MAP.get(tag, tag): value for tag, value in raw.items()})
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    for col in NUMERIC_COLS:
-        df[col] = df[col].map(_to_number) if col in df.columns else 0.0
-
-    return df
-
-
-def year_chunks(start_ym, end_ym):
-    """
-    관세청 API는 조회기간이 1년을 넘으면 거부한다.
-    연 단위로 잘라 (시작, 종료) 목록을 만든다.
-    """
-    start_y, start_m = int(start_ym[:4]), int(start_ym[4:])
-    end_y, end_m = int(end_ym[:4]), int(end_ym[4:])
-
-    chunks = []
-    for year in range(start_y, end_y + 1):
-        first = f"{year:04d}{start_m:02d}" if year == start_y else f"{year:04d}01"
-        last = f"{year:04d}{end_m:02d}" if year == end_y else f"{year:04d}12"
-        chunks.append((first, last))
-    return chunks
+        return str(st.secrets.get("DATA_GO_KR_SERVICE_KEY", "")).strip()
+    except Exception:
+        return ""
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_chunk(service_key, hs_code, country_code, start_ym, end_ym):
-    """구간 하나를 조회한다. 월 1회 갱신되는 데이터라 1시간 캐시."""
-    params = {
-        "serviceKey": service_key,
-        "strtYymm": start_ym,
-        "endYymm": end_ym,
-        "cntyCd": country_code,
+def cached_trade(
+    service_key: str,
+    hs_code: str,
+    country_code: str,
+    start_ym: str,
+    end_ym: str,
+) -> pd.DataFrame:
+    return fetch_trade(service_key, hs_code, country_code, start_ym, end_ym)
+
+
+def load_sample(start_ym: str, end_ym: str, hs_code: str, country: str) -> pd.DataFrame:
+    return sample_data.build(start_ym, end_ym, hs_code, country)
+
+
+def set_result(
+    raw: pd.DataFrame,
+    *,
+    hs_code: str,
+    hs_label: str,
+    country: str,
+    start_ym: str,
+    end_ym: str,
+    demo: bool,
+) -> None:
+    st.session_state["raw"] = raw
+    st.session_state["periods"] = prepare_periods(raw)
+    st.session_state["meta"] = {
+        "hs": hs_code,
+        "label": hs_label,
+        "country": country,
+        "start": start_ym,
+        "end": end_ym,
     }
-    if hs_code:
-        params["hsSgn"] = hs_code
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(API_URL, params=params, timeout=20)
-            resp.raise_for_status()
-            return parse_response(resp.text)
-        except requests.RequestException as exc:
-            last_error = exc
-            time.sleep(1.5 * (attempt + 1))
-
-    raise RuntimeError(f"API 요청에 실패했습니다: {last_error}")
+    st.session_state["demo"] = demo
 
 
-def fetch_trade(service_key, hs_code, country_code, start_ym, end_ym, progress=None):
-    """기간을 연 단위로 나눠 조회한 뒤 하나로 합친다."""
-    chunks = year_chunks(start_ym, end_ym)
-    frames = []
+today = date.today()
+latest_complete = previous_month(today)
+default_start_year = max(2000, latest_complete.year - 2)
+deployed_key = get_deployed_key()
 
-    for index, (first, last) in enumerate(chunks):
-        if progress:
-            progress.progress(
-                (index + 1) / len(chunks),
-                text=f"{first[:4]}년 자료를 불러오는 중 ({index + 1}/{len(chunks)})",
+with st.sidebar:
+    st.markdown("<div class='sidebar-brand'>TRADE / INTELLIGENCE</div>", unsafe_allow_html=True)
+    st.markdown("### 분석 조건")
+    st.caption("품목·상대국·기간을 설정하고 월별 통관실적을 분석합니다.")
+
+    with st.form("query_form"):
+        data_mode = st.radio(
+            "데이터 모드",
+            ["샘플로 둘러보기", "관세청 API 조회"],
+            horizontal=True,
+            help="샘플은 화면 검토용 가상 데이터이며 실제 통계가 아닙니다.",
+        )
+
+        preset_labels = [f"{item['code']} · {item['label']}" for item in HS_PRESETS]
+        selected_preset = st.selectbox("기준 품목", preset_labels, index=0)
+        custom_hs = st.text_input(
+            "HS Code 직접 지정 (선택)",
+            placeholder="예: 391810",
+            help="입력하면 위 기준 품목보다 우선 적용됩니다.",
+        )
+        country_name = st.selectbox("상대국", list(COUNTRY_CODES), index=0)
+
+        year_options = list(range(2000, latest_complete.year + 1))
+        start_col, end_col = st.columns(2)
+        with start_col:
+            start_year = st.selectbox(
+                "시작 연도", year_options, index=year_options.index(default_start_year)
             )
-        frames.append(fetch_chunk(service_key, hs_code, country_code, first, last))
-        if index < len(chunks) - 1:
-            time.sleep(0.2)  # 초당 30건 제한을 넉넉히 피한다
+            start_month = st.selectbox("시작 월", list(range(1, 13)), index=0)
+        with end_col:
+            end_year = st.selectbox(
+                "종료 연도", year_options, index=year_options.index(latest_complete.year)
+            )
+            end_month = st.selectbox(
+                "종료 월", list(range(1, 13)), index=latest_complete.month - 1
+            )
 
-    frames = [f for f in frames if not f.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+        supplied_key = st.text_input(
+            "공공데이터포털 인증키",
+            type="password",
+            placeholder="배포 환경에 키가 없을 때만 입력",
+            disabled=data_mode == "샘플로 둘러보기",
+            help="일반 인증키(Decoding)를 사용합니다. 입력값은 세션 밖에 저장하지 않습니다.",
+        )
+        submitted = st.form_submit_button("분석 실행", type="primary", width="stretch")
 
-
-def split_periods(df):
-    """기간별 행만 남기고 '총계' 행은 버린다 (구간을 합치면 총계가 중복되므로)."""
-    if df.empty or "period" not in df.columns:
-        return df
-    keep = df["period"].astype(str).str.match(PERIOD_RE)
-    return df[keep].copy()
-
-
-def label_period(value):
-    """2016.01 → 16년 1월"""
-    match = PERIOD_RE.match(str(value).strip())
-    if match:
-        year, month = match.groups()
-        return f"{year[2:]}년 {int(month):d}월"
-    return str(value)
-
-
-def sort_key(value):
-    match = PERIOD_RE.match(str(value).strip())
-    return int(match.group(1) + match.group(2)) if match else 0
+    st.markdown(
+        "<div class='sidebar-help'><b>데이터 해석 기준</b><br>"
+        "수출은 FOB, 수입은 CIF 기준입니다. 금액은 USD, 중량은 kg이며 "
+        "최근 월 수치는 추후 정정될 수 있습니다.</div>",
+        unsafe_allow_html=True,
+    )
 
 
-# ─────────────────────────────────────────────────────────────
-# 화면
-# ─────────────────────────────────────────────────────────────
+selected_index = preset_labels.index(selected_preset)
+preset = HS_PRESETS[selected_index]
+hs_code = custom_hs.strip() or preset["code"]
+hs_label = "직접 입력" if custom_hs.strip() else preset["label"]
+start_ym = f"{start_year:04d}{start_month:02d}"
+end_ym = f"{end_year:04d}{end_month:02d}"
 
-st.set_page_config(
-    page_title="한국 수출입 무역통계 탐색기",
-    page_icon="⚓",
-    layout="wide",
-)
-theme.inject()
+if submitted:
+    if not hs_code.isdigit() or len(hs_code) not in {2, 4, 6, 10}:
+        st.sidebar.error("HS Code는 숫자 2·4·6·10자리로 입력해 주세요.")
+    elif start_ym > end_ym:
+        st.sidebar.error("시작 시점이 종료 시점보다 늦습니다.")
+    elif data_mode == "관세청 API 조회":
+        active_key = supplied_key.strip() or deployed_key
+        if not active_key:
+            st.sidebar.error("API 조회에는 공공데이터포털 인증키가 필요합니다.")
+        else:
+            with st.spinner("관세청 통관실적을 조회하고 월별로 정리하는 중입니다…"):
+                try:
+                    raw_result = cached_trade(
+                        normalize_key(active_key),
+                        hs_code,
+                        COUNTRY_CODES[country_name],
+                        start_ym,
+                        end_ym,
+                    )
+                except TradeDataError as exc:
+                    st.sidebar.error(str(exc))
+                else:
+                    set_result(
+                        raw_result,
+                        hs_code=hs_code,
+                        hs_label=hs_label,
+                        country=country_name,
+                        start_ym=start_ym,
+                        end_ym=end_ym,
+                        demo=False,
+                    )
+    else:
+        set_result(
+            load_sample(start_ym, end_ym, hs_code, country_name),
+            hs_code=hs_code,
+            hs_label=hs_label,
+            country=country_name,
+            start_ym=start_ym,
+            end_ym=end_ym,
+            demo=True,
+        )
+
+if "periods" not in st.session_state:
+    initial_start = f"{default_start_year:04d}01"
+    initial_end = f"{latest_complete.year:04d}{latest_complete.month:02d}"
+    set_result(
+        load_sample(initial_start, initial_end, HS_PRESETS[0]["code"], "미국"),
+        hs_code=HS_PRESETS[0]["code"],
+        hs_label=HS_PRESETS[0]["label"],
+        country="미국",
+        start_ym=initial_start,
+        end_ym=initial_end,
+        demo=True,
+    )
+
+periods = st.session_state["periods"]
+raw = st.session_state["raw"]
+meta = st.session_state["meta"]
+is_demo = st.session_state["demo"]
 
 st.markdown(
     """
     <div class="masthead">
-      <div class="masthead-mark">HS</div>
-      <div>
-        <h1>한국 수출입 무역통계 탐색기</h1>
-        <p>관세청 통관실적 기준 · HS Code별 수출입 추이 조회</p>
+      <div class="brand-lockup">
+        <div class="masthead-mark">KT</div>
+        <div>
+          <div class="eyebrow">Korea Trade Intelligence</div>
+          <h1>한국 수출입 무역 인텔리전스</h1>
+          <p>관세청 통관실적을 품목·시장·시간 관점에서 읽는 월별 분석 대시보드</p>
+        </div>
+      </div>
+      <div class="masthead-meta">
+        <div class="eyebrow">Decision support</div>
+        <div class="meta-copy">시장 모니터링 · 사업 검토 · 원자료 추출</div>
       </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.markdown("### 조회 조건")
-
-    service_key = st.text_input(
-        "공공데이터포털 인증키",
-        type="password",
-        help="마이페이지 → 개발계정에서 '일반 인증키(Decoding)'를 복사해 넣으세요. "
-             "비워두면 샘플 데이터로 화면을 둘러볼 수 있습니다.",
-    )
-
-    st.divider()
-
-    preset_names = ["직접 입력"] + [f"{p['code']} · {p['label']}" for p in HS_PRESETS]
-    picked = st.selectbox("품목 (HS Code)", preset_names)
-
-    if picked == "직접 입력":
-        hs_code = st.text_input("HS Code", value="3918", help="2 · 4 · 6 · 10단위 모두 가능")
-        hs_label = ""
-    else:
-        preset = HS_PRESETS[preset_names.index(picked) - 1]
-        hs_code = preset["code"]
-        hs_label = preset["label"]
-        st.caption(preset["note"])
-
-    country_name = st.selectbox("상대국", list(COUNTRY_CODES.keys()))
-    country_code = COUNTRY_CODES[country_name]
-
-    today = date.today()
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        start_year = st.number_input(
-            "시작 연도", min_value=2000, max_value=today.year, value=today.year - 2
-        )
-        start_month = st.number_input("시작 월", min_value=1, max_value=12, value=1)
-    with col_b:
-        end_year = st.number_input(
-            "종료 연도", min_value=2000, max_value=today.year, value=today.year
-        )
-        end_month = st.number_input(
-            "종료 월", min_value=1, max_value=12, value=max(1, today.month - 1)
-        )
-
-    start_ym = f"{start_year:04d}{start_month:02d}"
-    end_ym = f"{end_year:04d}{end_month:02d}"
-
-    run = st.button("조회", type="primary", width="stretch")
-
-    st.divider()
-    st.caption(
-        "금액 단위는 달러, 중량은 kg입니다. 수출은 FOB, 수입은 CIF 기준이며 "
-        "매월 15일경 전월까지 자료가 현행화됩니다. "
-        "API가 한 번에 1년까지만 조회를 허용해, 여러 해는 연 단위로 나눠 요청합니다."
-    )
-
-
-if start_ym > end_ym:
-    st.error("시작 시점이 종료 시점보다 늦습니다. 기간을 다시 선택해 주세요.")
-    st.stop()
-
-if not run and "df" not in st.session_state:
-    st.info(
-        "왼쪽에서 품목과 상대국, 기간을 고르고 **조회**를 누르세요. "
-        "인증키 없이 눌러도 샘플 데이터로 화면 구성을 볼 수 있습니다."
-    )
-    st.stop()
-
-if run:
-    if service_key.strip():
-        bar = st.progress(0.0, text="조회를 준비하는 중")
-        try:
-            df = fetch_trade(
-                normalize_key(service_key),
-                hs_code.strip(),
-                country_code,
-                start_ym,
-                end_ym,
-                progress=bar,
-            )
-            st.session_state["demo"] = False
-        except RuntimeError as exc:
-            bar.empty()
-            st.error(str(exc))
-            st.stop()
-        bar.empty()
-    else:
-        import sample_data
-
-        df = sample_data.build(start_ym, end_ym, hs_code.strip())
-        st.session_state["demo"] = True
-
-    st.session_state["df"] = df
-    st.session_state["meta"] = {
-        "hs": hs_code.strip(),
-        "label": hs_label,
-        "country": country_name,
-        "start": start_ym,
-        "end": end_ym,
-    }
-
-df = st.session_state.get("df", pd.DataFrame())
-meta = st.session_state.get("meta", {})
-is_demo = st.session_state.get("demo", False)
-
-if df.empty:
-    st.warning("해당 조건에 자료가 없습니다. HS Code 자릿수를 줄이거나 기간을 넓혀 보세요.")
-    st.stop()
-
-if is_demo:
-    st.markdown(
-        '<div class="demo-flag">샘플 데이터입니다. 실제 통계를 보려면 '
-        '왼쪽에 인증키를 입력하세요.</div>',
-        unsafe_allow_html=True,
-    )
-
-periods = split_periods(df)
-if periods.empty:
-    st.warning("기간별 자료가 없습니다. 조회 조건을 바꿔 보세요.")
-    st.stop()
-
-periods = periods.assign(_sort=periods["period"].map(sort_key)).sort_values("_sort")
-periods["label"] = periods["period"].map(label_period)
-
-total_export = periods["export_usd"].sum()
-total_import = periods["import_usd"].sum()
-balance = total_export - total_import
-
-heading = f"HS {meta.get('hs', '')}" if meta.get("hs") else "전체 품목"
-if meta.get("label"):
-    heading += f" · {meta['label']}"
-elif "item_name" in periods.columns:
-    name = str(periods["item_name"].iloc[0])
-    if name and name != "-":
-        heading += f" · {name}"
-
+coverage = f"{meta['start'][:4]}.{int(meta['start'][4:]):02d}—{meta['end'][:4]}.{int(meta['end'][4:]):02d}"
 st.markdown(
-    f"<div class='section-head'>{heading}"
-    f"<span>{meta.get('country', '')} · "
-    f"{label_period(meta.get('start', ''))} ~ {label_period(meta.get('end', ''))}</span></div>",
+    "<div class='trust-strip'>"
+    "<div class='trust-item'><div class='trust-label'>Source</div><div class='trust-value'>관세청 통관실적</div></div>"
+    f"<div class='trust-item'><div class='trust-label'>Coverage</div><div class='trust-value'>{theme.esc(coverage)}</div></div>"
+    "<div class='trust-item'><div class='trust-label'>Grain</div><div class='trust-value'>월별 · HS Code</div></div>"
+    "<div class='trust-item'><div class='trust-label'>Units</div><div class='trust-value'>USD · kg</div></div>"
+    "</div>",
     unsafe_allow_html=True,
 )
 
-theme.balance_scale(total_export, total_import)
+if is_demo:
+    st.markdown(
+        "<div class='status-banner'><span class='status-dot'></span><div>"
+        "<b>현재 화면은 샘플 모드입니다.</b> 수치는 실제 통계가 아니며, 왼쪽에서 ‘관세청 API 조회’를 "
+        "선택하면 공공데이터 기반 결과로 전환됩니다.</div></div>",
+        unsafe_allow_html=True,
+    )
 
-col1, col2, col3 = st.columns(3)
-col1.metric("수출 누계", f"{total_export/1_000_000:,.1f}백만 $")
-col2.metric("수입 누계", f"{total_import/1_000_000:,.1f}백만 $")
-col3.metric(
-    "무역수지",
-    f"{balance/1_000_000:,.1f}백만 $",
-    delta="흑자" if balance >= 0 else "적자",
-    delta_color="normal" if balance >= 0 else "inverse",
+if periods.empty:
+    st.warning("선택한 조건에 월별 데이터가 없습니다. HS Code 자릿수를 줄이거나 기간을 넓혀 보세요.")
+    st.stop()
+
+summary = analysis_summary(periods)
+query_title = f"HS {meta['hs']} · {meta['label']}"
+theme.section_title(
+    query_title,
+    f"상대국 {meta['country']} · {summary['months']}개월 관측 · 최신 관측월 {summary['latest_period']}",
 )
 
-st.markdown("<div class='rule'></div>", unsafe_allow_html=True)
+growth_note, growth_tone = format_rate(summary["recent_12_growth"], prefix="직전 12개월 대비 ")
+mom_note, mom_tone = format_rate(summary["export_mom"], prefix="전월 대비 ")
+balance_tone = "positive" if summary["balance"] >= 0 else "negative"
 
-tab_trend, tab_balance, tab_price, tab_table = st.tabs(["추이", "수지", "단가", "원자료"])
+kpi_cols = st.columns(4)
+with kpi_cols[0]:
+    theme.kpi_card("01", "수출 누계", format_money(summary["total_export"]), growth_note, growth_tone)
+with kpi_cols[1]:
+    theme.kpi_card("02", "수입 누계", format_money(summary["total_import"]), "조회 기간 합계")
+with kpi_cols[2]:
+    balance_label = "흑자" if summary["balance"] >= 0 else "적자"
+    theme.kpi_card("03", "무역수지", format_money(summary["balance"]), balance_label, balance_tone)
+with kpi_cols[3]:
+    theme.kpi_card("04", f"최근 월 수출 · {summary['latest_period']}", format_money(summary["latest_export"]), mom_note, mom_tone)
 
-with tab_trend:
-    chart_df = periods.set_index("label")[["export_usd", "import_usd"]]
-    chart_df.columns = ["수출", "수입"]
-    st.line_chart(chart_df, height=380, color=[theme.EXPORT, theme.IMPORT])
-    st.caption("단위: 달러")
+st.write("")
+overview_tab, balance_tab, data_tab, method_tab = st.tabs(
+    ["시장 흐름", "수지 · 단가", "데이터", "해석 기준"]
+)
 
-    if len(periods) >= 2:
-        first, last = periods.iloc[0], periods.iloc[-1]
-        if first["export_usd"] > 0:
-            change = (last["export_usd"] / first["export_usd"] - 1) * 100
-            direction = "늘었습니다" if change >= 0 else "줄었습니다"
-            st.markdown(
-                f"수출액은 {first['label']} 대비 {last['label']}에 "
-                f"**{abs(change):,.1f}%** {direction}."
-            )
-
-with tab_balance:
-    bal_df = periods.set_index("label")[["balance_usd"]]
-    bal_df.columns = ["무역수지"]
-    st.bar_chart(bal_df, height=380, color=theme.INK)
-    st.caption("단위: 달러 · 0보다 크면 흑자")
-
-    deficit = periods[periods["balance_usd"] < 0]
-    if not deficit.empty:
+with overview_tab:
+    chart_col, insight_col = st.columns([2.15, 1], gap="large")
+    with chart_col:
+        st.markdown("<div class='chart-heading'>월별 수출입 금액 추이</div>", unsafe_allow_html=True)
         st.markdown(
-            f"조회 기간 {len(periods)}개월 중 **{len(deficit)}개월**이 적자입니다."
+            "<div class='chart-subtitle'>동일 축 비교 · 실선은 수출, 파선은 수입 · 단위 USD</div>",
+            unsafe_allow_html=True,
+        )
+        trend_long = periods.melt(
+            id_vars=["period_date", "label"],
+            value_vars=["export_usd", "import_usd"],
+            var_name="flow_key",
+            value_name="value",
+        )
+        trend_long["구분"] = trend_long["flow_key"].map(
+            {"export_usd": "수출", "import_usd": "수입"}
+        )
+        trend_chart = (
+            alt.Chart(trend_long)
+            .mark_line(strokeWidth=2.5)
+            .encode(
+                x=alt.X("period_date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=8)),
+                y=alt.Y("value:Q", title="금액 (USD)", axis=alt.Axis(format="~s"), scale=alt.Scale(zero=True)),
+                color=alt.Color(
+                    "구분:N",
+                    scale=alt.Scale(domain=["수출", "수입"], range=[theme.EXPORT, theme.IMPORT]),
+                    legend=alt.Legend(title=None, orient="top", direction="horizontal"),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "구분:N", scale=alt.Scale(domain=["수출", "수입"], range=[[1, 0], [6, 4]]), legend=None
+                ),
+                tooltip=[
+                    alt.Tooltip("label:N", title="기간"),
+                    alt.Tooltip("구분:N"),
+                    alt.Tooltip("value:Q", title="금액", format="$,.0f"),
+                ],
+            )
+            .properties(height=350)
+        )
+        st.altair_chart(trend_chart, width="stretch")
+
+    with insight_col:
+        st.markdown("<div class='chart-heading'>핵심 관찰</div>", unsafe_allow_html=True)
+        st.markdown("<div class='chart-subtitle'>수치 변화의 빠른 스캔</div>", unsafe_allow_html=True)
+        yoy_text, _ = format_rate(summary["export_yoy"])
+        theme.insight_card(
+            "Momentum",
+            f"최근 월 수출 {yoy_text}",
+            "전년 동월 비교가 가능한 경우 같은 계절의 기준점과 비교합니다.",
+        )
+        theme.insight_card(
+            "Peak",
+            f"수출 고점 {summary['peak_export_period']}",
+            f"월 수출액 {format_money(summary['peak_export'])}로 조회 기간 중 가장 높았습니다.",
+        )
+        theme.insight_card(
+            "Balance",
+            f"적자 월 {summary['deficit_months']}개",
+            f"전체 {summary['months']}개월 중 무역수지가 0 미만인 월의 수입니다.",
         )
 
-with tab_price:
-    # 금액을 중량으로 나눠 kg당 단가를 만든다. 중량이 0인 구간은 비워 둔다.
-    unit = periods.copy()
-    unit["수출 단가"] = (unit["export_usd"] / unit["export_wgt"]).where(unit["export_wgt"] > 0)
-    unit["수입 단가"] = (unit["import_usd"] / unit["import_wgt"]).where(unit["import_wgt"] > 0)
+with balance_tab:
+    left_chart, right_chart = st.columns(2, gap="large")
+    with left_chart:
+        st.markdown("<div class='chart-heading'>월별 무역수지</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='chart-subtitle'>0선 위는 흑자, 아래는 적자 · 단위 USD</div>",
+            unsafe_allow_html=True,
+        )
+        balance_chart = (
+            alt.Chart(periods)
+            .mark_bar(size=11, cornerRadiusEnd=2)
+            .encode(
+                x=alt.X("period_date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=7)),
+                y=alt.Y("balance_usd:Q", title="무역수지 (USD)", axis=alt.Axis(format="~s")),
+                color=alt.condition(
+                    "datum.balance_usd >= 0", alt.value(theme.EXPORT), alt.value(theme.IMPORT)
+                ),
+                tooltip=[
+                    alt.Tooltip("label:N", title="기간"),
+                    alt.Tooltip("balance_usd:Q", title="무역수지", format="$,.0f"),
+                ],
+            )
+            .properties(height=330)
+        )
+        zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=theme.INK, opacity=.45).encode(y="y:Q")
+        st.altair_chart(balance_chart + zero_rule, width="stretch")
 
-    price_df = unit.set_index("label")[["수출 단가", "수입 단가"]]
-    if price_df.notna().any().any():
-        st.line_chart(price_df, height=380, color=[theme.EXPORT, theme.IMPORT])
-        st.caption("단위: 달러/kg · 신고금액을 신고중량으로 나눈 값")
-        avg_export = unit["수출 단가"].mean()
-        if pd.notna(avg_export):
-            st.markdown(f"조회 기간 평균 수출 단가는 **{avg_export:,.2f} $/kg** 입니다.")
+    with right_chart:
+        st.markdown("<div class='chart-heading'>kg당 신고단가 추이</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='chart-subtitle'>신고금액 ÷ 신고중량 · 품질·규격·운임 차이를 포함할 수 있음</div>",
+            unsafe_allow_html=True,
+        )
+        unit_long = periods.melt(
+            id_vars=["period_date", "label"],
+            value_vars=["export_unit_usd", "import_unit_usd"],
+            var_name="unit_key",
+            value_name="unit_value",
+        ).dropna(subset=["unit_value"])
+        unit_long["구분"] = unit_long["unit_key"].map(
+            {"export_unit_usd": "수출 단가", "import_unit_usd": "수입 단가"}
+        )
+        if unit_long.empty:
+            st.info("신고중량이 없어 kg당 단가를 계산할 수 없습니다.")
+        else:
+            unit_chart = (
+                alt.Chart(unit_long)
+                .mark_line(strokeWidth=2.2)
+                .encode(
+                    x=alt.X("period_date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, tickCount=7)),
+                    y=alt.Y("unit_value:Q", title="USD / kg", scale=alt.Scale(zero=False)),
+                    color=alt.Color(
+                        "구분:N",
+                        scale=alt.Scale(
+                            domain=["수출 단가", "수입 단가"], range=[theme.EXPORT, theme.IMPORT]
+                        ),
+                        legend=alt.Legend(title=None, orient="top"),
+                    ),
+                    strokeDash=alt.StrokeDash(
+                        "구분:N",
+                        scale=alt.Scale(domain=["수출 단가", "수입 단가"], range=[[1, 0], [6, 4]]),
+                        legend=None,
+                    ),
+                    tooltip=[
+                        alt.Tooltip("label:N", title="기간"),
+                        alt.Tooltip("구분:N"),
+                        alt.Tooltip("unit_value:Q", title="단가", format="$,.2f"),
+                    ],
+                )
+                .properties(height=330)
+            )
+            st.altair_chart(unit_chart, width="stretch")
+
+with data_tab:
+    theme.section_title("조회 데이터", "분석용 월 집계와 API 원자료를 구분해 확인하고 내려받을 수 있습니다.")
+    view_mode = st.radio("표 기준", ["월별 집계", "API 원자료"], horizontal=True)
+    if view_mode == "월별 집계":
+        display_table = periods[
+            [
+                "label", "export_usd", "export_wgt", "import_usd", "import_wgt",
+                "balance_usd", "export_unit_usd", "import_unit_usd",
+            ]
+        ].rename(
+            columns={
+                "label": "기간",
+                "export_usd": "수출액(USD)",
+                "export_wgt": "수출중량(kg)",
+                "import_usd": "수입액(USD)",
+                "import_wgt": "수입중량(kg)",
+                "balance_usd": "무역수지(USD)",
+                "export_unit_usd": "수출단가(USD/kg)",
+                "import_unit_usd": "수입단가(USD/kg)",
+            }
+        )
     else:
-        st.info("중량 자료가 없어 단가를 계산할 수 없습니다.")
+        raw_columns = [
+            col for col in [
+                "period", "hs_cd", "item_name", "country", "country_cd",
+                "export_usd", "export_wgt", "import_usd", "import_wgt", "balance_usd",
+            ] if col in raw.columns
+        ]
+        display_table = raw[raw_columns].rename(
+            columns={
+                "period": "기간", "hs_cd": "HS", "item_name": "품목", "country": "국가",
+                "country_cd": "국가코드", "export_usd": "수출액(USD)",
+                "export_wgt": "수출중량(kg)", "import_usd": "수입액(USD)",
+                "import_wgt": "수입중량(kg)", "balance_usd": "무역수지(USD)",
+            }
+        )
 
-with tab_table:
-    show_cols = [c for c in
-                 ["label", "hs_cd", "item_name", "country", "export_usd", "export_wgt",
-                  "import_usd", "import_wgt", "balance_usd"]
-                 if c in periods.columns]
-    renamed = {
-        "label": "기간",
-        "hs_cd": "HS",
-        "item_name": "품목",
-        "country": "국가",
-        "export_usd": "수출액($)",
-        "export_wgt": "수출중량(kg)",
-        "import_usd": "수입액($)",
-        "import_wgt": "수입중량(kg)",
-        "balance_usd": "무역수지($)",
-    }
-    table = periods[show_cols].rename(columns=renamed)
-    st.dataframe(table, width="stretch", hide_index=True)
-
-    buffer = io.StringIO()
-    table.to_csv(buffer, index=False)
+    st.dataframe(
+        display_table,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            col: st.column_config.NumberColumn(format="%,.2f" if "단가" in col else "%,.0f")
+            for col in display_table.columns if display_table[col].dtype.kind in "fi"
+        },
+    )
+    csv_buffer = io.StringIO()
+    display_table.to_csv(csv_buffer, index=False)
     st.download_button(
-        "CSV로 내려받기",
-        buffer.getvalue().encode("utf-8-sig"),
-        file_name=f"trade_{meta.get('hs','all')}_{meta.get('country','')}"
-                  f"_{meta.get('start','')}_{meta.get('end','')}.csv",
+        "CSV 내려받기",
+        data=csv_buffer.getvalue().encode("utf-8-sig"),
+        file_name=f"korea_trade_{meta['hs']}_{COUNTRY_CODES.get(meta['country'], 'all')}_{meta['start']}_{meta['end']}.csv",
         mime="text/csv",
     )
 
+with method_tab:
+    theme.section_title("지표 정의와 주의사항", "숫자를 비교하기 전에 반드시 확인해야 할 산식과 데이터 범위입니다.")
+    method_left, method_right = st.columns(2, gap="large")
+    with method_left:
+        st.markdown(
+            """
+            **핵심 지표 정의**
+
+            - **수출액**: 수출신고 기준 FOB 금액(USD)
+            - **수입액**: 수입신고 기준 CIF 금액(USD)
+            - **무역수지**: 수출액 − 수입액
+            - **kg당 신고단가**: 신고금액 ÷ 신고중량
+            - **최근 12개월 증감률**: 최근 12개월 합계와 직전 12개월 합계 비교
+            """
+        )
+    with method_right:
+        st.markdown(
+            """
+            **해석 시 주의**
+
+            - FOB와 CIF의 가격 기준이 달라 수출·수입 단가의 직접 비교에는 한계가 있습니다.
+            - HS 2·4단위 조회는 여러 세부 품목을 포함하므로 월별로 합산합니다.
+            - 최근 1~2개월 수치는 신고 정정과 반영 시차로 변경될 수 있습니다.
+            - 신고단가는 품질, 규격, 운임, 환율과 품목 구성 변화의 영향을 함께 받습니다.
+            """
+        )
+    st.info("이 대시보드는 시장 탐색과 1차 판단을 위한 도구입니다. 투자·계약 판단 전에는 원자료와 품목 분류를 재확인하세요.")
+
 st.markdown(
-    "<div class='footnote'>데이터 출처: 공공데이터포털 · 관세청 품목별 국가별 수출입실적</div>",
+    "<div class='source-note'>SOURCE · 공공데이터포털 / 관세청 품목별 국가별 수출입실적 &nbsp;·&nbsp; "
+    "REFRESH · 통상 매월 15일경 전월분 현행화 &nbsp;·&nbsp; "
+    "METHOD · 월별 행 집계, 총계 행 제외, 무역수지 재계산</div>",
     unsafe_allow_html=True,
 )
